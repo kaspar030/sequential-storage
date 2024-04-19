@@ -712,6 +712,7 @@ impl Key for &[u8] {
     }
 
     fn serialize_into(&self, buffer: &mut [u8]) -> usize {
+        // store the length of the key in the first byte
         buffer[0] = self.len().try_into().unwrap();
         buffer[1..].copy_from_slice(self);
         self.len()
