@@ -150,9 +150,10 @@ pub async fn fetch_item<'d, K: Key, V: Value<'d>, S: NorFlash>(
     let item = item.reborrow(data_buffer);
 
     let data_len = item.data().len();
+    let key_len = K::len_from(item.data());
 
     Ok(Some(
-        V::deserialize_from(&item.destruct().1[K::LEN..][..data_len - K::LEN])
+        V::deserialize_from(&item.destruct().1[key_len..][..data_len - key_len])
             .map_err(Error::MapValueError)?,
     ))
 }
@@ -265,7 +266,7 @@ async fn fetch_item_with_location<'d, K: Key, S: NorFlash>(
 
         let mut it = ItemIter::new(page_data_start_address, page_data_end_address);
         while let Some((item, address)) = it.next(flash, data_buffer).await? {
-            if K::deserialize_from(&item.data()[..K::LEN]) == search_key {
+            if K::deserialize_from(&item.data()[..]) == search_key {
                 newest_found_item_address = Some(address);
             }
         }
@@ -412,10 +413,10 @@ async fn store_item_inner<'d, K: Key, S: NorFlash>(
                 calculate_page_end_address::<S>(flash_range.clone(), partial_open_page)
                     - S::WORD_SIZE as u32;
 
-            key.serialize_into(&mut data_buffer[..K::LEN]);
-            let item_data_length = K::LEN
+            let key_len = key.serialize_into(&mut data_buffer[..]);
+            let item_data_length = key_len
                 + item
-                    .serialize_into(&mut data_buffer[K::LEN..])
+                    .serialize_into(&mut data_buffer[key_len..])
                     .map_err(Error::MapValueError)?;
 
             let free_spot_address = find_next_free_item_spot(
@@ -604,7 +605,7 @@ async fn remove_item_inner<K: Key, S: MultiwriteNorFlash>(
                 item::MaybeItem::Corrupted(_, _) => continue,
                 item::MaybeItem::Erased(_, _) => continue,
                 item::MaybeItem::Present(item) => {
-                    let item_key = K::deserialize_from(&item.data()[..K::LEN]);
+                    let item_key = K::deserialize_from(&item.data());
 
                     // If this item has the same key as the key we're trying to erase, then erase the item.
                     // But keep going! We need to erase everything.
@@ -633,29 +634,39 @@ async fn remove_item_inner<K: Key, S: MultiwriteNorFlash>(
 ///
 /// The `Eq` bound is used because we need to be able to compare keys and the
 /// `Clone` bound helps us pass the key around.
-pub trait Key: Eq + Clone + Sized {
+pub trait Key: Eq + Clone {
     /// The serialized length of the key
-    const LEN: usize;
-
+    fn len(&self) -> usize;
     /// Serialize the key into the given buffer.
-    /// The buffer is always of the same length as the [Self::LEN] constant.
-    fn serialize_into(&self, buffer: &mut [u8]);
+    /// The buffer might contain more space than the key needs.
+    fn serialize_into(&self, buffer: &mut [u8]) -> usize;
+
+    /// The serialized length of the key at `buffer`
+    fn len_from(buffer: &[u8]) -> usize;
+
     /// Deserialize the key from the given buffer.
-    /// The buffer is always of the same length as the [Self::LEN] constant.
+    /// The buffer might contain more than the key's data.
     fn deserialize_from(buffer: &[u8]) -> Self;
 }
 
 macro_rules! impl_key_num {
     ($int:ty) => {
         impl Key for $int {
-            const LEN: usize = core::mem::size_of::<Self>();
+            fn len(&self) -> usize {
+                core::mem::size_of::<Self>()
+            }
 
-            fn serialize_into(&self, buffer: &mut [u8]) {
-                buffer.copy_from_slice(&self.to_le_bytes());
+            fn len_from(_buffer: &[u8]) -> usize {
+                core::mem::size_of::<Self>()
+            }
+
+            fn serialize_into(&self, buffer: &mut [u8]) -> usize {
+                buffer[..core::mem::size_of::<Self>()].copy_from_slice(&self.to_le_bytes());
+                core::mem::size_of::<Self>()
             }
 
             fn deserialize_from(buffer: &[u8]) -> Self {
-                Self::from_le_bytes(buffer.try_into().unwrap())
+                Self::from_le_bytes(buffer[..core::mem::size_of::<Self>()].try_into().unwrap())
             }
         }
     };
@@ -673,14 +684,42 @@ impl_key_num!(i64);
 impl_key_num!(i128);
 
 impl<const N: usize> Key for [u8; N] {
-    const LEN: usize = N;
+    fn len(&self) -> usize {
+        N
+    }
 
-    fn serialize_into(&self, buffer: &mut [u8]) {
+    fn len_from(_buffer: &[u8]) -> usize {
+        N
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) -> usize {
         buffer.copy_from_slice(self);
+        N
     }
 
     fn deserialize_from(buffer: &[u8]) -> Self {
-        buffer[..Self::LEN].try_into().unwrap()
+        buffer[..N].try_into().unwrap()
+    }
+}
+
+impl Key for &[u8] {
+    fn len(&self) -> usize {
+        self.as_ref().len() + 1
+    }
+
+    fn len_from(buffer: &[u8]) -> usize {
+        buffer[0] as usize
+    }
+
+    fn serialize_into(&self, buffer: &mut [u8]) -> usize {
+        buffer[0] = self.len().try_into().unwrap();
+        buffer[1..].copy_from_slice(self);
+        self.len()
+    }
+
+    fn deserialize_from(buffer: &[u8]) -> Self {
+        let n = Self::len_from(buffer);
+        buffer[..n].try_into().unwrap()
     }
 }
 
@@ -818,7 +857,7 @@ async fn migrate_items<K: Key, S: NorFlash>(
         calculate_page_end_address::<S>(flash_range.clone(), source_page) - S::WORD_SIZE as u32,
     );
     while let Some((item, item_address)) = it.next(flash, data_buffer).await? {
-        let key = K::deserialize_from(&item.data()[..K::LEN]);
+        let key = K::deserialize_from(&item.data()[..]);
         let (_, data_buffer) = item.destruct();
 
         // We're in a decent state here
